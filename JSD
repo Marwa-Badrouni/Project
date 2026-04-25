@@ -1,0 +1,127 @@
+"""
+utils/jsd.py — Jensen-Shannon Divergence utilities.
+
+JSD(P || Q) = 0.5 * KL(P || M) + 0.5 * KL(Q || M)
+           where M = 0.5*(P+Q)
+
+Properties:
+  - Symmetric
+  - Bounded in [0, 1] (when using log base 2)
+  - Square root is a proper metric
+"""
+
+import numpy as np
+from scipy.stats import entropy
+from scipy.spatial.distance import jensenshannon
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from config import JSD_N_BINS, JSD_DIMS_TO_USE
+
+
+def _empirical_pdf(samples: np.ndarray, bins: int, range_: tuple) -> np.ndarray:
+    """Histogram-based empirical PDF, smoothed with a small epsilon."""
+    counts, _ = np.histogram(samples, bins=bins, range=range_)
+    pdf = counts.astype(float) + 1e-10   # Laplace smoothing avoids log(0)
+    return pdf / pdf.sum()
+
+
+def jsd_1d(p_samples: np.ndarray, q_samples: np.ndarray, bins: int = JSD_N_BINS) -> float:
+    """
+    Compute JSD between two 1-D sample arrays via histogram estimation.
+    Returns value in [0, 1].
+    """
+    lo = min(p_samples.min(), q_samples.min())
+    hi = max(p_samples.max(), q_samples.max())
+    if hi == lo:
+        return 0.0
+    r = (lo, hi)
+    P = _empirical_pdf(p_samples, bins, r)
+    Q = _empirical_pdf(q_samples, bins, r)
+    # scipy's jensenshannon returns sqrt(JSD); square it to get JSD in [0,1]
+    return float(jensenshannon(P, Q) ** 2)
+
+
+def cluster_jsd(cluster_embeddings: np.ndarray,
+                reference_embeddings: np.ndarray,
+                dims: int = JSD_DIMS_TO_USE) -> dict:
+    """
+    Compute per-dimension JSD between a cluster and a reference (benign) set.
+
+    Parameters
+    ----------
+    cluster_embeddings   : (n_cluster, latent_dim)
+    reference_embeddings : (n_ref, latent_dim)
+    dims                 : number of latent dimensions to use
+
+    Returns
+    -------
+    dict with:
+        per_dim   : np.ndarray  JSD value for each of the first `dims` dimensions
+        mean_jsd  : float       mean across dimensions
+        max_jsd   : float       max across dimensions
+    """
+    d = min(dims, cluster_embeddings.shape[1], reference_embeddings.shape[1])
+    per_dim = np.array([
+        jsd_1d(cluster_embeddings[:, i], reference_embeddings[:, i])
+        for i in range(d)
+    ])
+    return {
+        "per_dim":  per_dim,
+        "mean_jsd": float(per_dim.mean()),
+        "max_jsd":  float(per_dim.max()),
+    }
+
+
+def compute_all_cluster_jsds(embeddings: np.ndarray,
+                              cluster_labels: np.ndarray,
+                              benign_mask: np.ndarray = None) -> dict:
+    """
+    For every cluster ID, compute JSD against the benign reference.
+
+    Parameters
+    ----------
+    embeddings      : (N, latent_dim) array
+    cluster_labels  : (N,) int array of cluster IDs (-1 = noise in HDBSCAN)
+    benign_mask     : (N,) bool; if None, uses the largest cluster as reference
+
+    Returns
+    -------
+    results : dict[cluster_id → {mean_jsd, max_jsd, per_dim, n_samples}]
+    """
+    unique_ids = np.unique(cluster_labels)
+    unique_ids = unique_ids[unique_ids != -1]   # skip HDBSCAN noise
+
+    # Reference distribution: benign samples OR largest cluster
+    if benign_mask is not None and benign_mask.sum() > 10:
+        reference = embeddings[benign_mask]
+    else:
+        # Fallback: use cluster with most samples as reference
+        sizes = {c: (cluster_labels == c).sum() for c in unique_ids}
+        ref_id = max(sizes, key=sizes.get)
+        reference = embeddings[cluster_labels == ref_id]
+
+    results = {}
+    for cid in unique_ids:
+        mask = cluster_labels == cid
+        cluster = embeddings[mask]
+        if len(cluster) < 5:
+            continue
+        stats = cluster_jsd(cluster, reference)
+        stats["n_samples"] = int(mask.sum())
+        results[int(cid)] = stats
+
+    return results
+
+
+def anomaly_scores_from_jsd(jsd_results: dict,
+                             cluster_labels: np.ndarray) -> np.ndarray:
+    """
+    Assign each sample the mean_jsd of its cluster as an anomaly score.
+    Noise points (label=-1) get score=1.0.
+    """
+    scores = np.zeros(len(cluster_labels))
+    for cid, stats in jsd_results.items():
+        scores[cluster_labels == cid] = stats["mean_jsd"]
+    scores[cluster_labels == -1] = 1.0
+    return scores
