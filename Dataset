@@ -1,0 +1,137 @@
+"""
+data/loader.py — CIC-IoT dataset loading, cleaning, and preprocessing.
+
+Supports:
+  - Real CIC-IoT2023 CSV (one or multiple files in a directory)
+  - Automatic fall-through to synthetic data when no path is given
+"""
+
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+import warnings
+warnings.filterwarnings("ignore")
+
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from config import (
+    LABEL_COL, BENIGN_LABEL, TEST_SIZE, RANDOM_STATE,
+    DROP_COLS, TRAIN_ON_BENIGN_ONLY
+)
+from data.synthetic import make_synthetic_cic_iot
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+def load_dataset(path=None):
+    """
+    Load CIC-IoT dataset from `path` (CSV or directory of CSVs).
+    Falls back to synthetic generation if path is None.
+
+    Returns
+    -------
+    X_train, X_test : np.ndarray  (scaled features)
+    y_train, y_test : np.ndarray  (binary: 0=benign, 1=attack)
+    label_names     : list[str]   (original string labels for test set)
+    feature_names   : list[str]
+    scaler          : fitted StandardScaler
+    """
+    if path is None:
+        print("[DataLoader] No dataset path provided — using synthetic CIC-IoT data.")
+        df = make_synthetic_cic_iot()
+    else:
+        df = _load_csv(path)
+
+    df = _clean(df)
+    feature_names = [c for c in df.columns if c not in (LABEL_COL, "binary_label")]
+
+    # Binary label: 0 = benign, 1 = attack
+    df["binary_label"] = (df[LABEL_COL] != BENIGN_LABEL).astype(int)
+    label_names_all = df[LABEL_COL].values
+
+    X = df[feature_names].values.astype(np.float32)
+    y = df["binary_label"].values
+    labels_str = df[LABEL_COL].values
+
+    X_train, X_test, y_train, y_test, ln_train, ln_test = train_test_split(
+        X, y, labels_str,
+        test_size=TEST_SIZE,
+        random_state=RANDOM_STATE,
+        stratify=y,
+    )
+
+    scaler = StandardScaler()
+    if TRAIN_ON_BENIGN_ONLY:
+        # Fit scaler only on benign training traffic
+        X_train_sc = scaler.fit(X_train[y_train == 0]).transform(X_train)
+    else:
+        X_train_sc = scaler.fit_transform(X_train)
+    X_test_sc = scaler.transform(X_test)
+
+    print(f"[DataLoader] Train: {X_train_sc.shape}  "
+          f"(benign={int((y_train==0).sum())}, attack={int((y_train==1).sum())})")
+    print(f"[DataLoader] Test : {X_test_sc.shape}  "
+          f"(benign={int((y_test==0).sum())}, attack={int((y_test==1).sum())})")
+    print(f"[DataLoader] Features: {len(feature_names)}")
+
+    return X_train_sc, X_test_sc, y_train, y_test, ln_test, feature_names, scaler
+
+
+def _load_csv(path):
+    path = Path(path)
+    if path.is_dir():
+        csvs = list(path.glob("*.csv"))
+        if not csvs:
+            raise FileNotFoundError(f"No CSV files found in {path}")
+        print(f"[DataLoader] Found {len(csvs)} CSV files in {path}")
+        dfs = []
+        for f in csvs:
+            try:
+                dfs.append(pd.read_csv(f, low_memory=False))
+            except Exception as e:
+                print(f"  [warn] Could not read {f.name}: {e}")
+        df = pd.concat(dfs, ignore_index=True)
+    else:
+        print(f"[DataLoader] Loading {path.name}")
+        df = pd.read_csv(path, low_memory=False)
+
+    # Normalise column names (CIC datasets have inconsistent spacing)
+    df.columns = df.columns.str.strip()
+    return df
+
+
+def _clean(df):
+    # ── Label column discovery ────────────────────────────────────────────────
+    # CIC-IoT CSVs use various label column names
+    for candidate in ["label", "Label", "Attack", "attack_type", "Class"]:
+        if candidate in df.columns:
+            df = df.rename(columns={candidate: LABEL_COL})
+            break
+    if LABEL_COL not in df.columns:
+        raise ValueError(
+            f"Could not find label column. Columns: {df.columns.tolist()}"
+        )
+
+    # ── Drop meta / ID columns ────────────────────────────────────────────────
+    drop = [c for c in DROP_COLS if c in df.columns]
+    df = df.drop(columns=drop)
+
+    # ── Remove infinite / NaN ─────────────────────────────────────────────────
+    df = df.replace([np.inf, -np.inf], np.nan)
+    before = len(df)
+    df = df.dropna()
+    print(f"[DataLoader] Dropped {before - len(df)} rows with NaN/Inf")
+
+    # ── Keep only numeric feature columns ────────────────────────────────────
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    df = df[numeric_cols + [LABEL_COL]]
+
+    # ── Clip extreme outliers (99.9th percentile) ────────────────────────────
+    feat_cols = [c for c in df.columns if c != LABEL_COL]
+    upper = df[feat_cols].quantile(0.999)
+    df[feat_cols] = df[feat_cols].clip(upper=upper, axis=1)
+
+    print(f"[DataLoader] Classes: {df[LABEL_COL].value_counts().to_dict()}")
+    return df
